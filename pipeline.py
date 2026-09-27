@@ -46,16 +46,19 @@ DATE_FORMATS = [
     "%b %d, %Y",
 ]
 
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "pipeline.log"), mode="w"),
-        logging.StreamHandler(),
-    ],
-)
 log = logging.getLogger("pipeline")
+
+
+def configure_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(LOG_DIR, "pipeline.log"), mode="w"),
+            logging.StreamHandler(),
+        ],
+    )
 
 
 # ---------------------------------------------------------------- extract --
@@ -156,6 +159,10 @@ def extract_scanned_reports(raw_dir):
 
 def extract():
     csv_path = os.path.join(RAW_DIR, "expenses_raw.csv")
+    if not os.path.isdir(RAW_DIR) or not os.path.exists(csv_path):
+        raise SystemExit(
+            f"No raw data found in {RAW_DIR}. Run `python generate_messy_data.py` first."
+        )
     records = extract_csv(csv_path)
     records += extract_scanned_reports(RAW_DIR)
     log.info("extract: %d raw records total", len(records))
@@ -178,20 +185,23 @@ def clean_date(raw_date):
 
 def clean_category(raw_category):
     if not raw_category or not raw_category.strip():
-        return None, "missing_category"
+        return None, "missing_category", False
     text = raw_category.strip().replace("_", " ")
     lowered = text.lower()
     if lowered in _CATEGORY_LOOKUP:
-        return _CATEGORY_LOOKUP[lowered], None
+        return _CATEGORY_LOOKUP[lowered], None, False
 
-    normalized = re.sub(r"[^a-z&]", "", lowered)
+    normalized = re.sub(r"[^a-z]", "", lowered)
     if normalized in _CATEGORY_NORMALIZED:
-        return _CATEGORY_NORMALIZED[normalized], None
+        return _CATEGORY_NORMALIZED[normalized], None, False
 
     match = difflib.get_close_matches(lowered, _CATEGORY_LOOKUP.keys(), n=1, cutoff=0.6)
     if match:
-        return _CATEGORY_LOOKUP[match[0]], None
-    return None, "unrecognized_category"
+        canonical = _CATEGORY_LOOKUP[match[0]]
+        score = difflib.SequenceMatcher(None, lowered, match[0]).ratio()
+        log.info("fuzzy category match: %r -> %r (score=%.2f)", text, canonical, score)
+        return canonical, None, True
+    return None, "unrecognized_category", False
 
 
 def clean_amount(raw_amount):
@@ -213,6 +223,7 @@ def clean_and_validate(raw_records):
     clean_rows = []
     rejected_rows = []
     seen = set()
+    fuzzy_matched = 0
 
     for rec in raw_records:
         date_val, err = clean_date(rec["raw_date"])
@@ -220,10 +231,12 @@ def clean_and_validate(raw_records):
             rejected_rows.append({**rec, "reason": err})
             continue
 
-        category_val, err = clean_category(rec["raw_category"])
+        category_val, err, was_fuzzy = clean_category(rec["raw_category"])
         if err:
             rejected_rows.append({**rec, "reason": err})
             continue
+        if was_fuzzy:
+            fuzzy_matched += 1
 
         amount_val, err = clean_amount(rec["raw_amount"])
         if err:
@@ -256,10 +269,10 @@ def clean_and_validate(raw_records):
         )
 
     log.info(
-        "clean/validate: %d rows accepted, %d rows rejected",
-        len(clean_rows), len(rejected_rows),
+        "clean/validate: %d rows accepted, %d rows rejected, %d fuzzy-matched categories",
+        len(clean_rows), len(rejected_rows), fuzzy_matched,
     )
-    return clean_rows, rejected_rows
+    return clean_rows, rejected_rows, fuzzy_matched
 
 
 # ------------------------------------------------------------------- load --
@@ -295,16 +308,34 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     run_at TEXT NOT NULL,
     rows_extracted INTEGER NOT NULL,
     rows_loaded INTEGER NOT NULL,
-    rows_rejected INTEGER NOT NULL
+    rows_rejected INTEGER NOT NULL,
+    rows_fuzzy_matched INTEGER NOT NULL DEFAULT 0
 );
 """
 
 
-def load(clean_rows, rejected_rows, raw_count):
+def load(clean_rows, rejected_rows, raw_count, fuzzy_matched):
+    # expenses/rejected_rows are rebuilt from scratch every run (the pipeline
+    # re-extracts everything from data/raw/ each time, it isn't incremental),
+    # but pipeline_runs should accumulate. Build the new contents in a temp
+    # file and swap it in atomically, carrying prior run rows forward, so a
+    # failure mid-load can't destroy the existing database.
+    prior_runs = []
     if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+        old_conn = sqlite3.connect(DB_PATH)
+        try:
+            prior_runs = old_conn.execute(
+                "SELECT run_at, rows_extracted, rows_loaded, rows_rejected, rows_fuzzy_matched FROM pipeline_runs ORDER BY id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            prior_runs = []
+        old_conn.close()
 
-    conn = sqlite3.connect(DB_PATH)
+    tmp_path = DB_PATH + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    conn = sqlite3.connect(tmp_path)
     conn.executescript(SCHEMA)
 
     now = datetime.now(timezone.utc).isoformat()
@@ -323,20 +354,28 @@ def load(clean_rows, rejected_rows, raw_count):
         [{**row, "rejected_at": now} for row in rejected_rows],
     )
 
+    if prior_runs:
+        conn.executemany(
+            "INSERT INTO pipeline_runs (run_at, rows_extracted, rows_loaded, rows_rejected, rows_fuzzy_matched) VALUES (?, ?, ?, ?, ?)",
+            prior_runs,
+        )
+
     conn.execute(
-        "INSERT INTO pipeline_runs (run_at, rows_extracted, rows_loaded, rows_rejected) VALUES (?, ?, ?, ?)",
-        (now, raw_count, len(clean_rows), len(rejected_rows)),
+        "INSERT INTO pipeline_runs (run_at, rows_extracted, rows_loaded, rows_rejected, rows_fuzzy_matched) VALUES (?, ?, ?, ?, ?)",
+        (now, raw_count, len(clean_rows), len(rejected_rows), fuzzy_matched),
     )
 
     conn.commit()
     conn.close()
+    os.replace(tmp_path, DB_PATH)
     log.info("load: wrote %d clean rows and %d rejected rows to %s", len(clean_rows), len(rejected_rows), DB_PATH)
 
 
 def main():
+    configure_logging()
     raw_records = extract()
-    clean_rows, rejected_rows = clean_and_validate(raw_records)
-    load(clean_rows, rejected_rows, len(raw_records))
+    clean_rows, rejected_rows, fuzzy_matched = clean_and_validate(raw_records)
+    load(clean_rows, rejected_rows, len(raw_records), fuzzy_matched)
     log.info("pipeline complete: %s", DB_PATH)
 
 

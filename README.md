@@ -29,6 +29,13 @@ That's it. The first two commands build `data/raw/` (the messy inputs) and
 `warehouse.db` (the clean output) from nothing. The data generator uses a
 fixed random seed, so you'll get the same messy data every time you run it.
 
+To run the unit tests for the clean/validate functions:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## The pipeline, stage by stage
 
 `pipeline.py` is one file, split into four stages that run in order:
@@ -43,13 +50,16 @@ this stage just turns messy text into raw records.
 **Clean.** Each raw record gets three fields normalized:
 - *Dates* get tried against a list of known formats (`3/14/2024`,
   `2024-03-14`, `14-Mar-2024`, `March 14, 2024`, and a few more) until one
-  fits, then converted to plain ISO format (`2024-03-14`).
+  fits, then converted to plain ISO format (`2024-03-14`). The pipe-table
+  scanned report only ever prints a month and day (`Mar 14`), so the
+  extractor hardcodes `2024` onto those rows to match the rest of the batch.
 - *Categories* get matched against a fixed list of eight canonical names
   (Travel, Office Supplies, Software, and so on). Exact matches and
   underscore/spacing/case variants resolve immediately. Anything else goes
   through a fuzzy match (Python's built-in `difflib`) against the canonical
   list, which is how "Travle", "Softwar", and "Proffesional Services" all
-  land in the right bucket.
+  land in the right bucket. Every fuzzy match is logged as `from -> to
+  (score)`, so a coercion that guessed wrong is traceable after the fact.
 - *Amounts* get stripped of `$` and commas and parsed as numbers.
 
 **Validate.** A row is rejected if:
@@ -66,8 +76,11 @@ disappears.
 
 **Load.** Whatever survives validation gets written to an `expenses` table
 in `warehouse.db`, along with which source file it came from. The pipeline
-also records a summary of the run (rows extracted, loaded, rejected) in a
-`pipeline_runs` table.
+also records a summary of the run (rows extracted, loaded, rejected,
+fuzzy-matched categories) in a `pipeline_runs` table. `expenses` and
+`rejected_rows` are rebuilt from scratch every run (the pipeline re-reads
+`data/raw/` each time, it isn't incremental), but `pipeline_runs` keeps every
+past run so you can see the history.
 
 ## Before and after
 
@@ -75,30 +88,36 @@ A few rows straight from the raw CSV:
 
 ```
 row_id,date,category,amount,description,submitted_by,department
-1,1/11/2024,Utilities,1938.6,Electricity - co-working space,Diego Schmidt,Support
-2,5/1/2024,Utillities,1209.3,Internet - satellite office,Sam Okafor,Finance
-3,"October 17, 2024",Equpiment,816.1,Webcam,Wei Rossi,Engineering
-5,,Prof. Services,2309.42,Freelance designer,Diego Rivera,Finance
+1,11/21/2024,UTILITIES,901.22,Phone plan reimbursement,Anna Dubois,Engineering
+2,10-11-2024,Softwar,396.7,Design tool subscription,Liam Novak,Finance
+3,1/19/2024,Offce Supplies,1332.98,Printer paper,Liam Singh,Support
+4,06-10-2024,office supplies,385.33,Whiteboard markers,Anna Novak,Marketing
+5,2024-05-16,,1880.14,Water bill - office,Priya Novak,Finance
 ```
 
 What lands in `expenses` after cleaning:
 
 ```
-source      source_ref  date        category    amount   description
-csv_export  row_id=1    2024-01-11  Utilities   1938.6   Electricity - co-working space
-csv_export  row_id=2    2024-05-01  Utilities   1209.3   Internet - satellite office
-csv_export  row_id=3    2024-10-17  Equipment   816.1    Webcam
+source      source_ref  date        category         amount    description
+csv_export  row_id=1    2024-11-21  Utilities         901.22    Phone plan reimbursement
+csv_export  row_id=2    2024-10-11  Software          396.7     Design tool subscription
+csv_export  row_id=3    2024-01-19  Office Supplies   1332.98   Printer paper
+csv_export  row_id=4    2024-06-10  Office Supplies   385.33    Whiteboard markers
 ```
 
-Row 5 doesn't show up in `expenses` at all. It has no date, so it lands in
-`rejected_rows` with `reason = missing_date` instead. "Prof. Services" would
-have matched to Professional Services just fine, it's the missing date that
-kills it.
+Row 5 doesn't show up in `expenses` at all. It has no category, so it lands
+in `rejected_rows` with `reason = missing_category` instead. `2024-05-16` and
+`1880.14` both parse fine, it's the blank category that kills it. "Softwar"
+and "Offce Supplies" (rows 2 and 3) are both misspelled but land correctly
+anyway, that's the fuzzy match at work.
 
 ## The dashboard
 
 `dashboard/app.py` is a Streamlit app that reads straight from
-`warehouse.db`. Four views:
+`warehouse.db`. Top row of metrics includes rows extracted, loaded,
+rejected, and fuzzy-matched (that last one is the count of category values
+that didn't match exactly and got coerced by `difflib`). Below that, four
+views:
 
 1. **Spend by category** - total dollars per canonical category
 2. **Rejection reasons** - count of rejected rows, grouped by why
@@ -106,7 +125,8 @@ kills it.
 4. **Clean rows loaded by source** - CSV export vs. each scanned report
 
 Plus two expandable tables if you want to browse the clean and rejected rows
-directly.
+directly. It re-reads `warehouse.db` whenever the file changes, so re-running
+the pipeline with the dashboard open picks up fresh numbers.
 
 ## Project layout
 
@@ -114,6 +134,7 @@ directly.
 generate_messy_data.py   builds the messy source files
 pipeline.py               extract -> clean -> validate -> load
 dashboard/app.py          the Streamlit dashboard
+tests/test_pipeline.py    unit tests for the clean/validate functions
 data/raw/                 generated messy inputs (not committed)
 warehouse.db              generated SQLite output (not committed)
 logs/pipeline.log         generated rejection log (not committed)

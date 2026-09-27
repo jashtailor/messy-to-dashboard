@@ -126,32 +126,49 @@ def build_csv_rows(n=520):
     for i in range(1, n + 1):
         rows.append(make_row(i))
 
-    # Sprinkle in real-world mess on top of the base rows.
+    # Sprinkle in real-world mess on top of the base rows. Each corruption
+    # pass gets its own disjoint slice of row indices, sampled once up front,
+    # so no row is corrupted twice and the counts below map directly to the
+    # rejection reasons the pipeline produces.
+    counts = {
+        "duplicate": 22,
+        "missing_amount": 12,
+        "missing_date": 10,
+        "garbled_date": 8,
+        "negative_amount": 9,
+        "blank_category": 7,
+    }
+    picks = random.sample(range(n), sum(counts.values()))
+    cursor = 0
+    slices = {}
+    for key, count in counts.items():
+        slices[key] = picks[cursor:cursor + count]
+        cursor += count
 
-    # 1. Exact duplicates (someone re-uploaded the same export).
-    for row in random.sample(rows, 22):
-        dup = dict(row)
-        rows.append(dup)
+    # 1. Exact duplicates (someone re-uploaded the same export). Copy before
+    # any corruption pass runs, so the pair stays identical.
+    for i in slices["duplicate"]:
+        rows.append(dict(rows[i]))
 
     # 2. Missing amount.
-    for row in random.sample(rows, 12):
-        row["amount"] = ""
+    for i in slices["missing_amount"]:
+        rows[i]["amount"] = ""
 
     # 3. Missing date.
-    for row in random.sample(rows, 10):
-        row["date"] = ""
+    for i in slices["missing_date"]:
+        rows[i]["date"] = ""
 
     # 4. Garbled / unparseable date.
-    for row in random.sample(rows, 8):
-        row["date"] = random.choice(["N/A", "see attached", "13/45/2024", "unknown", "--"])
+    for i in slices["garbled_date"]:
+        rows[i]["date"] = random.choice(["N/A", "see attached", "13/45/2024", "unknown", "--"])
 
     # 5. Zero or negative amount (refunds entered wrong, typos).
-    for row in random.sample(rows, 9):
-        row["amount"] = round(random.uniform(-200, 0), 2)
+    for i in slices["negative_amount"]:
+        rows[i]["amount"] = round(random.uniform(-200, 0), 2)
 
     # 6. Blank category.
-    for row in random.sample(rows, 7):
-        row["category"] = ""
+    for i in slices["blank_category"]:
+        rows[i]["category"] = ""
 
     random.shuffle(rows)
     for i, row in enumerate(rows, start=1):
