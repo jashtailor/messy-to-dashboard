@@ -1,0 +1,7 @@
+data/
+warehouse.db
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
